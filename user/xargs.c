@@ -55,7 +55,7 @@ int main(int argc, char *argv[]) {
             ++p;
         }
 
-        // 4.3 创建子进程
+        // 4.3 如果没有参数，退出
         if (fork() == 0) {
             exec(argv[1], x_argv);
         }
@@ -63,3 +63,4 @@ int main(int argc, char *argv[]) {
     }
     exit(0);
 }
+
