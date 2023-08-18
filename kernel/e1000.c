@@ -92,6 +92,7 @@ e1000_init(uint32 *xregs)
   regs[E1000_IMS] = (1 << 7); // RXDW -- Receiver Descriptor Write Back
 }
 
+// 发送以太网数据帧到网卡
 int
 e1000_transmit(struct mbuf *m)
 {
@@ -102,10 +103,38 @@ e1000_transmit(struct mbuf *m)
   // the TX descriptor ring so that the e1000 sends it. Stash
   // a pointer so that it can be freed after sending.
   //
-  
+  uint32 tail;
+  struct tx_desc *desc;
+
+  // 读取发送尾指针对应的寄存器regs[E1000_TDT]获取到软件可以写入的位置
+  acquire(&e1000_lock);
+  tail = regs[E1000_TDT];
+  desc = &tx_ring[tail];
+  // 检查尾指针指向的描述符是否在状态中写入了E1000_TXD_STAT_DD标志位
+  if ((desc->status & E1000_TXD_STAT_DD) == 0) {
+    release(&e1000_lock);
+    return -1;
+  }
+  // 释放尾指针执行的描述符对应的缓冲区
+  if (tx_mbufs[tail]) {
+    mbuffree(tx_mbufs[tail]);
+  }
+  // 更新尾指针指向的描述符的不同字段
+  desc->addr = (uint64) m->head;
+  desc->length = m->len;
+  desc->cmd = E1000_TXD_CMD_EOP | E1000_TXD_CMD_RS;
+  tx_mbufs[tail] = m;
+
+  // 设置内存屏障，避免可能的指令重排导致描述符还未更新完毕就移动了尾指针
+  __sync_synchronize();
+
+  regs[E1000_TDT] = (tail + 1) % TX_RING_SIZE;
+  release(&e1000_lock);
+
   return 0;
 }
 
+// 从网卡接收数据到内核
 static void
 e1000_recv(void)
 {
@@ -115,6 +144,34 @@ e1000_recv(void)
   // Check for packets that have arrived from the e1000
   // Create and deliver an mbuf for each packet (using net_rx()).
   //
+
+  int tail = (regs[E1000_RDT] + 1) % RX_RING_SIZE;
+  struct rx_desc *desc = &rx_ring[tail];
+
+  // 一次中断触发后网卡软件会一直将可解封装的数据传递到网络栈
+  while ((desc->status & E1000_RXD_STAT_DD)) {
+    if(desc->length > MBUF_SIZE) {
+      panic("e1000 len");
+    }
+    // 更新接收缓冲区的长度
+    rx_mbufs[tail]->len = desc->length;
+    // 接收缓冲区rx_mbufs[idx]中为待处理的数据帧
+    net_rx(rx_mbufs[tail]);     
+    // 分配一个新的接收缓冲区替代发送给网络栈的缓冲区
+    rx_mbufs[tail] = mbufalloc(0);
+    if (!rx_mbufs[tail]) {
+      panic("e1000 no mubfs");
+    }
+    desc->addr = (uint64) rx_mbufs[tail]->head;
+    // 替换了接收缓冲区，清空status状态字段
+    desc->status = 0;
+    
+    tail = (tail + 1) % RX_RING_SIZE;
+    desc = &rx_ring[tail];
+  }
+
+  regs[E1000_RDT] = (tail - 1) % RX_RING_SIZE;
+
 }
 
 void
