@@ -16,6 +16,52 @@ void kernelvec();
 
 extern int devintr();
 
+// 模仿vm.c中的walkaddr函数，增加对COW的处理部分
+uint64 walkcowaddr(pagetable_t pagetable, uint64 va) {
+  pte_t *pte;
+  uint64 pa;
+  char* mem;
+  uint flags;
+
+  if (va >= MAXVA)
+    return 0;
+
+  pte = walk(pagetable, va, 0);
+  if (pte == 0)
+      return 0;
+  if ((*pte & PTE_V) == 0)
+      return 0;
+  if ((*pte & PTE_U) == 0)
+    return 0;
+  pa = PTE2PA(*pte);
+  // 判断写标志位是否不存在
+  if ((*pte & PTE_W) == 0) {
+    // 没有COW标志的PTE不能申请页表
+    if ((*pte & PTE_COW) == 0) {
+        return 0;
+    }
+    // 分配新物理页
+    if ((mem = kalloc()) == 0) {
+      return 0;
+    }
+    // 拷贝页表内容
+    memmove(mem, (void*)pa, PGSIZE);
+    // 更新标志位
+    flags = (PTE_FLAGS(*pte) & (~PTE_COW)) | PTE_W;
+    // 取消原映射
+    uvmunmap(pagetable, PGROUNDDOWN(va), 1, 1);
+    // 更新新映射
+    if (mappages(pagetable, PGROUNDDOWN(va), PGSIZE, (uint64)mem, flags) != 0) {
+      kfree(mem);
+      return 0;
+    }
+    // COW情况下返回新物理地址
+    return (uint64)mem;
+  }
+  return pa;
+}
+
+
 void
 trapinit(void)
 {
@@ -65,45 +111,20 @@ usertrap(void)
     intr_on();
 
     syscall();
-  } else if(r_scause() == 13 || r_scause() == 15){
-    char *mem;
-    uint64 va = r_stval();
-    // 处理 page fault 的虚拟地址超过 p->sz 或低于用户栈的情况,分为超过和小于两种情况
-    if(va >= p->sz)
-    {
-      printf("usertrap(): invalid va=%p higher than p->sz=%p\n", va, p->sz);
-      p->killed = 1;
-      goto end;
-    }
-    if(va < PGROUNDUP(p->trapframe->sp))
-    {
-      printf("usertrap(): invalid va=%p below the user stack sp=%p\n", va, p->trapframe->sp);
-      p->killed = 1;
-      goto end;
-    }
-    // 分配物理页失败
-    if ((mem=kalloc()) == 0)
-    {
-      p->killed = 1;
-      goto end;
-    }
-    memset(mem, 0, PGSIZE);
-    // 进行页表映射以及失败的情况
-    if (mappages(p->pagetable, PGROUNDDOWN(r_stval()), PGSIZE, (uint64)mem, PTE_W | PTE_X | PTE_R | PTE_U) != 0)
-    {
-      kfree(mem);
-      panic("usertrap:mappages");
-      p->killed = 1;
+  } else if(r_scause()==15) {
+    // 考虑 r_scause()==15 的条件, 因为只有在 store 指令写操作时触发 page fault 才考虑 COW 机制
+    if (walkcowaddr(p->pagetable, r_stval()) == 0) {
+      goto bad;
     }
   } else if((which_dev = devintr()) != 0){
     // ok
   } else {
+bad:
     printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
     printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
     p->killed = 1;
   }
 
-end:
   if(p->killed)
     exit(-1);
 

@@ -5,8 +5,6 @@
 #include "riscv.h"
 #include "defs.h"
 #include "fs.h"
-#include "spinlock.h"
-#include "proc.h"
 
 /*
  * the kernel's page table.
@@ -98,32 +96,15 @@ walkaddr(pagetable_t pagetable, uint64 va)
 {
   pte_t *pte;
   uint64 pa;
-  struct proc *p = myproc();
 
   if(va >= MAXVA)
     return 0;
 
   pte = walk(pagetable, va, 0);
-  
-  // lazy allocation - lab5-3
-  if(pte == 0 || (*pte & PTE_V) == 0) {
-    // va is on the user heap  
-    if(va >= PGROUNDUP(p->trapframe->sp) && va < p->sz){
-        char *pa;
-        if ((pa = kalloc()) == 0) {
-            return 0;
-        }
-        memset(pa, 0, PGSIZE);
-        if (mappages(p->pagetable, PGROUNDDOWN(va), PGSIZE,
-                     (uint64) pa, PTE_W | PTE_R | PTE_U) != 0) {
-            kfree(pa);
-            return 0;
-        }
-    } else {
-        return 0;
-    }
-  }
-
+  if(pte == 0)
+    return 0;
+  if((*pte & PTE_V) == 0)
+    return 0;
   if((*pte & PTE_U) == 0)
     return 0;
   pa = PTE2PA(*pte);
@@ -199,14 +180,10 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
     panic("uvmunmap: not aligned");
 
   for(a = va; a < va + npages*PGSIZE; a += PGSIZE){
-    // sbrk()申请的内存太大,导致一部分虚拟地址不存在
     if((pte = walk(pagetable, a, 0)) == 0)
-      continue;
-      // panic("uvmunmap: walk");
-    // 虚拟内存不对应物理内存，不应该panic
+      panic("uvmunmap: walk");
     if((*pte & PTE_V) == 0)
-      continue;
-    // panic("uvmunmap: not mapped");
+      panic("uvmunmap: not mapped");
     if(PTE_FLAGS(*pte) == PTE_V)
       panic("uvmunmap: not a leaf");
     if(do_free){
@@ -334,24 +311,32 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   pte_t *pte;
   uint64 pa, i;
   uint flags;
-  char *mem;
+  // char *mem;
 
   for(i = 0; i < sz; i += PGSIZE){
     if((pte = walk(old, i, 0)) == 0)
-      continue;
-      // panic("uvmcopy: pte should exist");
+      panic("uvmcopy: pte should exist");
     if((*pte & PTE_V) == 0)
-      continue;
-      // panic("uvmcopy: page not present");
+      panic("uvmcopy: page not present");
     pa = PTE2PA(*pte);
-    flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
-      goto err;
-    memmove(mem, (char*)pa, PGSIZE);
-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
-      kfree(mem);
+
+    // 去除原有的写标志位PTE_W，添加COW标志位PTE_COW
+    flags = (PTE_FLAGS(*pte) & (~PTE_W)) | PTE_COW;
+    *pte = PA2PTE(pa) | flags;
+
+    // flags = PTE_FLAGS(*pte);
+    // 不再申请新的页表
+    // if((mem = kalloc()) == 0)
+    //   goto err;
+    // memmove(mem, (char*)pa, PGSIZE);
+
+    // 这里使用老的pa替换mem
+    if(mappages(new, i, PGSIZE, pa, flags) != 0){
+      // kfree(mem);
       goto err;
     }
+    // 调用引用计数加1
+    increfcnt(pa);
   }
   return 0;
 
@@ -383,7 +368,8 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
 
   while(len > 0){
     va0 = PGROUNDDOWN(dstva);
-    pa0 = walkaddr(pagetable, va0);
+    // 将walkaddr换为walkcowaddr
+    pa0 = walkcowaddr(pagetable, va0);
     if(pa0 == 0)
       return -1;
     n = PGSIZE - (dstva - va0);
