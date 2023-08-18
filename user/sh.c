@@ -54,6 +54,7 @@ void panic(char*);
 struct cmd *parsecmd(char*);
 
 // Execute cmd.  Never returns.
+__attribute__((__noreturn__))
 void
 runcmd(struct cmd *cmd)
 {
